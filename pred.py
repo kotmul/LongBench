@@ -2,74 +2,104 @@ import os
 from datasets import load_dataset
 import torch
 import json
-from transformers import AutoTokenizer, LlamaTokenizer, LlamaForCausalLM, AutoModelForCausalLM
+from transformers import LlamaTokenizer, LlamaForCausalLM
 from tqdm import tqdm
 import numpy as np
 import random
 import argparse
-from llama_flash_attn_monkey_patch import replace_llama_attn_with_flash_attn
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from lemma.lemma_utils.prefix_vars import PAD_TOKEN_ID, PAD_TOKEN, LEMMA_TOKEN, LEMMA_TOKEN_ID, SENTENCE_ENCODER_MAX_LENGTH
+import spacy
+from lemma.model.language_model.lemma_llama import LemmaLlama
+from peft import PeftModel
+
+
+LEMMA_TOKEN = "<|reserved_special_token_119|>"
+SENTENCE_ENCODER_MAX_LENGTH = 4096
+PAD_TOKEN = "<|reserved_special_token_112|>"
+PAD_TOKEN_ID = 128117
+
+LLAMA_SFT_TEMPLATE = (
+"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system_prompt}"
+"<|eot_id|><|start_header_id|>context<|end_header_id|>\n\n{context}"
+"<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{instruction}"
+"<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
+)
+
+LEMMA_SFT_TEMPLATE = (
+"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system_prompt}"
+"<|eot_id|><|start_header_id|>context-embedding<|end_header_id|>\n\n{context}"
+"<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{instruction}"
+"<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
+)
+
+nlp = spacy.load("en_core_web_sm")
+
+def sentence_segmentation(text):
+    doc = nlp(text)  # 텍스트 처리
+    sentences = [sent.text.strip() for sent in doc.sents]  # 문장 추출
+    return sentences
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, default=None, choices=["llama2-7b-chat-4k", "longchat-v1.5-7b-32k", "xgen-7b-8k", "internlm-7b-8k", "chatglm2-6b", "chatglm2-6b-32k", "chatglm3-6b-32k", "vicuna-v1.5-7b-16k"])
+    parser.add_argument('--model', type=str, default=None, choices=["llama2-7b-chat-4k", "longchat-v1.5-7b-32k", "xgen-7b-8k", "internlm-7b-8k", "chatglm2-6b", "chatglm2-6b-32k", "chatglm3-6b-32k", "vicuna-v1.5-7b-16k", \
+                                                                    "llama3-8b", "lemma-llama"])
     parser.add_argument('--e', action='store_true', help="Evaluate on LongBench-E")
+    parser.add_argument('--peft_path', type=str, default=None)
     return parser.parse_args(args)
 
-# This is the customized building prompt for chat models
-def build_chat(tokenizer, prompt, model_name):
-    if "chatglm3" in model_name:
-        prompt = tokenizer.build_chat_input(prompt)
-    elif "chatglm" in model_name:
-        prompt = tokenizer.build_prompt(prompt)
-    elif "longchat" in model_name or "vicuna" in model_name:
-        from fastchat.model import get_conversation_template
-        conv = get_conversation_template("vicuna")
-        conv.append_message(conv.roles[0], prompt)
-        conv.append_message(conv.roles[1], None)
-        prompt = conv.get_prompt()
-    elif "llama2" in model_name:
-        prompt = f"[INST]{prompt}[/INST]"
-    elif "xgen" in model_name:
-        header = (
-            "A chat between a curious human and an artificial intelligence assistant. "
-            "The assistant gives helpful, detailed, and polite answers to the human's questions.\n\n"
-        )
-        prompt = header + f" ### Human: {prompt}\n###"
-    elif "internlm" in model_name:
-        prompt = f"<|User|>:{prompt}<eoh>\n<|Bot|>:"
-    return prompt
-
-def post_process(response, model_name):
-    if "xgen" in model_name:
-        response = response.strip().replace("Assistant:", "")
-    elif "internlm" in model_name:
-        response = response.split("<eoa>")[0]
-    return response
-
-def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset, device, model_name, model2path, out_path):
+def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset, device, model_name, model2path, out_path, peft_path):
     device = torch.device(f'cuda:{rank}')
-    model, tokenizer = load_model_and_tokenizer(model2path[model_name], model_name, device)
+    model, tokenizer = load_model_and_tokenizer(model2path[model_name], model_name, device, peft_path)
+    prompt_structure = LEMMA_SFT_TEMPLATE if "lemma" in model_name else LLAMA_SFT_TEMPLATE
+
     for json_obj in tqdm(data):
-        prompt = prompt_format.format(**json_obj)
+        # This Part is for Dataset Cause Each Dataset has differenct Structure.
+        if dataset in ['gov_report', 'multi_news', 'passage_count']:
+            sys = prompt_format['system_prompt']
+            context = json_obj['context']
+            instruction = prompt_format['instruction']
+
+        elif dataset in ['passage_retrieval_en']:
+            sys = prompt_format['system_prompt']
+            context = json_obj['context']
+            instruction = prompt_format['instruction'][0] + json_obj['input'] + tgt[dataset]['instruction'][1]
+
+        else:
+            sys = prompt_format['system_prompt']
+            context = json_obj['context']
+            instruction = prompt_format['instruction'] + json_obj['input']
+
+        # For OUR LEMMA
+        if "lemma" in model_name:
+            input_sentences = sentence_segmentation(context)
+            
+            sent_input_ids = tokenizer(input_sentences, return_tensors='pt', padding=True)['input_ids'].to('cuda')
+            ctx_features = model.encode(input_sentences_ids=sent_input_ids)
+
+            context_embedding_len = len(ctx_features) if len(ctx_features) <= SENTENCE_ENCODER_MAX_LENGTH else SENTENCE_ENCODER_MAX_LENGTH
+            context = LEMMA_TOKEN * context_embedding_len
+
+
+        prompt_dict = {"system_prompt": sys, "context": context, "instruction": instruction}
+
+        # TODO: Prompt에 맞게 다시 짜기
+        prompt = prompt_structure.format(**prompt_dict)
         # truncate to fit max_length (we suggest truncate in the middle, since the left and right side may contain crucial instructions)
         tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
-        if "chatglm3" in model_name:
-            tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt", add_special_tokens=False).input_ids[0]
+        
         if len(tokenized_prompt) > max_length:
             half = int(max_length/2)
             prompt = tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True)+tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
-        if dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]: # chat models are better off without build prompts on these tasks
-            prompt = build_chat(tokenizer, prompt, model_name)
-        if "chatglm3" in model_name:
-            if dataset in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]:
-                input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
-            else:
-                input = prompt.to(device)
-        else:
-            input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
+        
+        input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
+
+        if "lemma" in model_name:
+            input['ctx_features'] = ctx_features
+            
         context_length = input.input_ids.shape[-1]
+
         if dataset == "samsum": # prevent illegal output on samsum (model endlessly repeat "\nDialogue"), might be a prompting issue
             output = model.generate(
                 **input,
@@ -88,8 +118,9 @@ def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset
                 do_sample=False,
                 temperature=1.0,
             )[0]
+
         pred = tokenizer.decode(output[context_length:], skip_special_tokens=True)
-        pred = post_process(pred, model_name)
+        
         with open(out_path, "a", encoding="utf-8") as f:
             json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"]}, f, ensure_ascii=False)
             f.write('\n')
@@ -104,28 +135,41 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
     torch.cuda.manual_seed_all(seed)
 
-def load_model_and_tokenizer(path, model_name, device):
-    if "chatglm" in model_name or "internlm" in model_name or "xgen" in model_name:
-        tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True, torch_dtype=torch.bfloat16).to(device)
-    elif "llama2" in model_name:
-        replace_llama_attn_with_flash_attn()
+def load_model_and_tokenizer(path, model_name, device, peft_path):
+    if "llama3" in model_name:
+        print(f"Loading **{model_name}** model")
+        model = LlamaForCausalLM.from_pretrained(
+            pretrained_model_name_or_path=path,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            use_cache=False,
+            pad_token_id=PAD_TOKEN_ID,
+            attn_implementation="flash_attention_2",
+        ).to(device)
         tokenizer = LlamaTokenizer.from_pretrained(path)
-        model = LlamaForCausalLM.from_pretrained(path, torch_dtype=torch.bfloat16).to(device)
-    elif "longchat" in model_name or "vicuna" in model_name:
-        from fastchat.model import load_model
-        replace_llama_attn_with_flash_attn()
-        model, _ = load_model(
-            path,
-            device='cpu',
-            num_gpus=0,
-            load_8bit=False,
-            cpu_offloading=False,
-            debug=False,
+        tokenizer.pad_token = PAD_TOKEN
+        
+    if "lemma" in model_name:
+        print(f"Loading **{model_name}** model")
+        model = LemmaLlama.from_pretrained(
+            pretrained_model_name_or_path=path,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            use_cache=False,
+            pad_token_id=PAD_TOKEN_ID,
+            attn_implementation="flash_attention_2",
+        ).to(device)
+        tokenizer = LlamaTokenizer.from_pretrained(path)
+        tokenizer.pad_token = PAD_TOKEN
+
+    if peft_path is not None:
+        print(f"Loading PEFT Adapter from {peft_path}...")
+        model = PeftModel.from_pretrained(
+            model,
+            peft_path, 
         )
-        model = model.to(device)
-        model = model.bfloat16()
-        tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, use_fast=False)
+        model = model.merge_and_unload()
+
     model = model.eval()
     return model, tokenizer
 
@@ -139,17 +183,18 @@ if __name__ == '__main__':
     model2maxlen = json.load(open("config/model2maxlen.json", "r"))
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model_name = args.model
+    peft_path = args.peft_path
     # define your model
     max_length = model2maxlen[model_name]
     if args.e:
         datasets = ["qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "gov_report", "multi_news", \
-            "trec", "triviaqa", "samsum", "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
+            "trec", "triviaqa", "samsum", "passage_count", "passage_retrieval_en"]
     else:
-        datasets = ["narrativeqa", "qasper", "multifieldqa_en", "multifieldqa_zh", "hotpotqa", "2wikimqa", "musique", \
-                    "dureader", "gov_report", "qmsum", "multi_news", "vcsum", "trec", "triviaqa", "samsum", "lsht", \
-                    "passage_count", "passage_retrieval_en", "passage_retrieval_zh", "lcc", "repobench-p"]
+        datasets = ["narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", \
+                    "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
+                    "passage_count", "passage_retrieval_en"]
     # we design specific prompt format and max generation length for each task, feel free to modify them to optimize model output
-    dataset2prompt = json.load(open("config/dataset2prompt.json", "r"))
+    dataset2prompt = json.load(open("config/dataset2prompt_ver2.json", "r"))
     dataset2maxlen = json.load(open("config/dataset2maxlen.json", "r"))
     # predict on each dataset
     if not os.path.exists("pred"):
@@ -174,7 +219,7 @@ if __name__ == '__main__':
         processes = []
         for rank in range(world_size):
             p = mp.Process(target=get_pred, args=(rank, world_size, data_subsets[rank], max_length, \
-                        max_gen, prompt_format, dataset, device, model_name, model2path, out_path))
+                        max_gen, prompt_format, dataset, device, model_name, model2path, out_path, peft_path))
             p.start()
             processes.append(p)
         for p in processes:

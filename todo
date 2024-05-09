@@ -1,0 +1,13 @@
+** Evaluation에 모델 추가하는 방법 **
+1. ./config/model2path.json 에 모델 이름 맵핑하기
+2. pred.py 내의 load_model_and_tokenizer 함수에서 원하는 모델 불러오는 코드 작성하기
+3. 잘 나오고 싶으면 프롬프트도 작성하기 >> 특히 Lemma >> build_chat 함수 작성하기 && 길이 짜르는것도 다시 작성하기
+4. Lemma에 맞게 generate 코드도 작성하기
+
+
+
+** TODO LIST **
+
+[ ] Llama3 추가하기
+[ ] Llama3 돌려보기
+[ ] Lemma 모델 추가하기
