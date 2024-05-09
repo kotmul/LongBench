@@ -2,7 +2,7 @@ import os
 from datasets import load_dataset
 import torch
 import json
-from transformers import LlamaTokenizer, LlamaForCausalLM
+from transformers import LlamaTokenizer, LlamaForCausalLM, AutoTokenizer
 from tqdm import tqdm
 import numpy as np
 import random
@@ -49,6 +49,7 @@ def parse_args(args=None):
     parser.add_argument('--peft_path', type=str, default=None)
     return parser.parse_args(args)
 
+@torch.inference_mode()
 def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset, device, model_name, model2path, out_path, peft_path):
     device = torch.device(f'cuda:{rank}')
     model, tokenizer = load_model_and_tokenizer(model2path[model_name], model_name, device, peft_path)
@@ -64,7 +65,7 @@ def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset
         elif dataset in ['passage_retrieval_en']:
             sys = prompt_format['system_prompt']
             context = json_obj['context']
-            instruction = prompt_format['instruction'][0] + json_obj['input'] + tgt[dataset]['instruction'][1]
+            instruction = prompt_format['instruction'][0] + json_obj['input'] + prompt_format['instruction'][1]
 
         else:
             sys = prompt_format['system_prompt']
@@ -75,7 +76,7 @@ def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset
         if "lemma" in model_name:
             input_sentences = sentence_segmentation(context)
             
-            sent_input_ids = tokenizer(input_sentences, return_tensors='pt', padding=True)['input_ids'].to('cuda')
+            sent_input_ids = tokenizer(input_sentences, return_tensors='pt', padding=True)['input_ids'].to(device)
             ctx_features = model.encode(input_sentences_ids=sent_input_ids)
 
             context_embedding_len = len(ctx_features) if len(ctx_features) <= SENTENCE_ENCODER_MAX_LENGTH else SENTENCE_ENCODER_MAX_LENGTH
@@ -96,7 +97,7 @@ def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset
         input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
 
         if "lemma" in model_name:
-            input['ctx_features'] = ctx_features
+            input['ctx_features'] = ctx_features.unsqueeze(0)
             
         context_length = input.input_ids.shape[-1]
 
@@ -151,24 +152,19 @@ def load_model_and_tokenizer(path, model_name, device, peft_path):
         
     if "lemma" in model_name:
         print(f"Loading **{model_name}** model")
+        
         model = LemmaLlama.from_pretrained(
-            pretrained_model_name_or_path=path,
+            pretrained_model_name_or_path=peft_path,
             torch_dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
             use_cache=False,
             pad_token_id=PAD_TOKEN_ID,
+            device_map=device,
             attn_implementation="flash_attention_2",
-        ).to(device)
-        tokenizer = LlamaTokenizer.from_pretrained(path)
+        )
+        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B")
         tokenizer.pad_token = PAD_TOKEN
 
-    if peft_path is not None:
-        print(f"Loading PEFT Adapter from {peft_path}...")
-        model = PeftModel.from_pretrained(
-            model,
-            peft_path, 
-        )
-        model = model.merge_and_unload()
 
     model = model.eval()
     return model, tokenizer
@@ -193,7 +189,7 @@ if __name__ == '__main__':
         datasets = ["narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", \
                     "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
                     "passage_count", "passage_retrieval_en"]
-    # we design specific prompt format and max generation length for each task, feel free to modify them to optimize model output
+
     dataset2prompt = json.load(open("config/dataset2prompt_ver2.json", "r"))
     dataset2maxlen = json.load(open("config/dataset2maxlen.json", "r"))
     # predict on each dataset

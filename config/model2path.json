@@ -8,5 +8,5 @@
     "chatglm3-6b-32k": "THUDM/chatglm3-6b-32k",
     "vicuna-v1.5-7b-16k": "lmsys/vicuna-7b-v1.5-16k",
     "llama3-8b-inst": "meta-llama/Meta-Llama-3-8B-Instruct",
-    "lemma-llama": "</s>"
+    "lemma-llama": "MLP-Lemma/lemma-llama-pt-9000ckpt"
 }
